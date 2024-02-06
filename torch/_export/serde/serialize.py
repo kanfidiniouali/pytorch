@@ -235,7 +235,15 @@ def serialize_tensor_meta(t: torch.Tensor) -> TensorMeta:
     )
 
 
-def serialize_torch_artifact(artifact) -> bytes:
+class SerializedFake:
+    pass
+
+
+def serialize_torch_artifact(artifact: Dict[str, Any]) -> bytes:
+    for name, val in artifact.items():
+        if isinstance(val, FakeTensor):
+            artifact[name] = SerializedFake()
+
     buffer = io.BytesIO()
     # This is a workaround for backend's tensor deserialization problem:
     # unpickleTensor() always create a tensor on the device where it was originally saved
@@ -245,14 +253,6 @@ def serialize_torch_artifact(artifact) -> bytes:
     # TODO: this should be fixed by deserialization instead.
     torch.save(artifact, buffer)
     return buffer.getvalue()
-
-
-def deserialize_torch_artifact(serialized: bytes):
-    if len(serialized) == 0:
-        return {}
-    buffer = io.BytesIO(serialized)
-    buffer.seek(0)
-    return torch.load(buffer)
 
 
 def _sympy_int_to_int(val: sympy.Expr):
@@ -1115,6 +1115,8 @@ class GraphModuleDeserializer:
         signature: ep.ExportGraphSignature
         module_call_graph: List[ep.ModuleCallEntry]
         names_to_symbols: Dict[str, sympy.Symbol]
+        state_dict: Dict[str, Union[torch.Tensor, torch.nn.Parameter]]
+        constants: Dict[str, Union[torch.Tensor, torch.ScriptObject]]
 
     def __init__(self):
         self.serialized_name_to_node: Dict[str, torch.fx.Node] = {}
@@ -1230,8 +1232,7 @@ class GraphModuleDeserializer:
         else:
             raise SerializeError(f"Unable to deserialize output node {output}")
 
-    def deserialize_graph(self, serialized_graph: Graph) -> torch.fx.Graph:
-        # Handle the tensor metas.
+    def deserialize_metas(self, serialized_graph: Graph) -> None:
         for name, tensor_value in serialized_graph.tensor_values.items():
             meta_val = self.deserialize_tensor_meta(tensor_value, self.fake_tensor_mode)
             self.serialized_name_to_meta[name] = meta_val
@@ -1245,6 +1246,7 @@ class GraphModuleDeserializer:
         for name, script_obj_meta in serialized_graph.custom_obj_values.items():
             self.serialized_name_to_meta[name] = self.deserialize_script_obj_meta(script_obj_meta)
 
+    def deserialize_graph(self, serialized_graph: Graph) -> torch.fx.Graph:
         # Inputs: convert to placeholder nodes in FX.
         for i, input_ in enumerate(serialized_graph.inputs):
             if input_.type in ("as_tensor", "as_sym_int", "as_custom_obj"):
@@ -1406,8 +1408,9 @@ class GraphModuleDeserializer:
     def deserialize(
         self,
         serialized_graph_module: GraphModule,
+        serialized_state_dict: bytes,
+        constants: bytes,
         symbol_name_to_range: Optional[Dict[str, symbolic_shapes.ValueRanges]] = None,
-        constants: Optional[Dict[str, Any]] = None,
     ) -> Result:
         self.shape_env = symbolic_shapes.ShapeEnv(assume_static_by_default=True)
         self.fake_tensor_mode = FakeTensorMode(
@@ -1417,9 +1420,10 @@ class GraphModuleDeserializer:
         )
         self.symbol_name_to_symbol: Dict[str, sympy.Symbol] = {}
         self.symbol_name_to_range = {} if symbol_name_to_range is None else symbol_name_to_range
-        self.constants = {} if constants is None else constants
         self.signature = self.deserialize_signature(serialized_graph_module.signature)
 
+        self.deserialize_metas(serialized_graph_module.graph)
+        self.constants = self.deserialize_torch_artifact(constants)
         self.deserialize_graph(serialized_graph_module.graph)
 
         module_call_graph = self.deserialize_module_call_graph(serialized_graph_module.module_call_graph)
@@ -1428,7 +1432,36 @@ class GraphModuleDeserializer:
             signature=self.signature,
             module_call_graph=module_call_graph,
             names_to_symbols=self.symbol_name_to_symbol,
+            state_dict=self.deserialize_torch_artifact(serialized_state_dict),
+            constants=self.constants,
         )
+
+    def deserialize_torch_artifact(self, serialized: bytes):
+        if len(serialized) == 0:
+            return {}
+        buffer = io.BytesIO(serialized)
+        buffer.seek(0)
+        artifact = torch.load(buffer)
+        assert isinstance(artifact, dict)
+
+        for name, value in artifact.items():
+            if isinstance(value, SerializedFake):
+                # We need to restore a fake tensor with the same properties.
+                # The metadata for this fake tensor is stored on the
+                # corresponding graph input.
+                spec = None
+                for input_spec in self.signature.input_specs:
+                    if input_spec.target == name:
+                        spec = input_spec
+                        break
+
+                assert spec is not None
+                fake_tensor = self.serialized_name_to_meta[spec.arg.name]
+                if spec.kind == ep.InputKind.PARAMETER:
+                    fake_tensor = torch.nn.Parameter(fake_tensor)
+                artifact[name] = fake_tensor
+        return artifact
+
 
     def sync_fx_node(self, name: str, fx_node: torch.fx.Node):
         if name in self.serialized_name_to_node:
@@ -1736,14 +1769,13 @@ class ExportedProgramDeserializer:
             k: symbolic_shapes.ValueRanges(_int_to_sympy_int(v.min_val), _int_to_sympy_int(v.max_val))
             for k, v in serialized_artifact.exported_program.range_constraints.items()
         }
-        constants = deserialize_torch_artifact(serialized_artifact.constants)
-
         res = (
             GraphModuleDeserializer()
             .deserialize(
                 serialized_artifact.exported_program.graph_module,
+                serialized_artifact.state_dict,
+                serialized_artifact.constants,
                 symbol_name_to_range,
-                constants,
             )
         )
         range_constraints = self.deserialize_range_constraints(
@@ -1754,18 +1786,16 @@ class ExportedProgramDeserializer:
 
         upgrader = GraphModuleOpUpgrader(self.expected_opset_version, model_opset_version)
 
-        state_dict = deserialize_torch_artifact(serialized_artifact.state_dict)
-
         exported_program = ep.ExportedProgram(
             root=res.graph_module,
             graph=res.graph_module.graph,
             graph_signature=res.signature,
-            state_dict=state_dict,  # type: ignore[arg-type]
+            state_dict=res.state_dict,  # type: ignore[arg-type]
             range_constraints=range_constraints,
             module_call_graph=res.module_call_graph,
             example_inputs=None,
             verifier=load_verifier(serialized_artifact.exported_program.dialect),
-            constants=constants,
+            constants=res.constants,
         )
         return upgrader.upgrade(exported_program)
 
